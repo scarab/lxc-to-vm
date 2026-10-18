@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Legacy Debian 7 Wheezy conversion support: Linux 3.2-compatible ext4,
+  Wheezy GRUB and archived APT packages, IDE guest disk, preserved IPv4/MAC/MTU,
+  and guest-agent-free VM validation. See `docs/debian-7-wheezy.md`.
+
+### Fixed
+
+- Source container size incorrectly displayed as 0 B during conversions.
+- Legacy Debian systemd unit paths under `/lib/systemd/system` not handled.
+
+
 ## [6.2.0] - 2026-10-14
 
 ## [6.1.1] - 2026-10-14

@@ -2363,6 +2363,24 @@ MOUNT_POINT="${TEMP_DIR}/mnt"
 log "Source CTID=$CTID  Target VMID=$VMID  Storage=$STORAGE  Disk=${DISK_SIZE}GB  Format=$DISK_FORMAT  Bridge=$BRIDGE  ExtraPkgs=${PKG_ADDON_LIST:-none}"
 log "Working directory: $TEMP_DIR"
 
+# Detect Debian 7 before creating the filesystem: Linux 3.2 cannot read
+# all ext4 features enabled by a modern e2fsprogs/mke2fs.
+WHEEZY_GUEST=false
+if [[ "$(pct config "$CTID" | awk '/^ostype:/{print $2; exit}')" == "debian" ]]; then
+    log "Checking source Debian version before disk formatting..."
+    pct_mount_retry "$CTID" || die "Cannot mount CT $CTID for Debian version detection."
+    if [[ -f "/var/lib/lxc/$CTID/rootfs/etc/debian_version" ]] &&
+       grep -qE '^7([.]|$)' "/var/lib/lxc/$CTID/rootfs/etc/debian_version"; then
+        WHEEZY_GUEST=true
+    fi
+    pct unmount "$CTID" || die "Cannot unmount CT $CTID after Debian version check."
+fi
+if $WHEEZY_GUEST; then
+    [[ "$BIOS_TYPE" == "seabios" ]] || die "Debian 7 Wheezy conversion supports SeaBIOS only."
+    warn "Debian 7 Wheezy (EOL): legacy ext4, GRUB, and APT handling enabled."
+    warn "Expired APT archive signatures will be accepted in the copied guest only."
+fi
+
 # Create Workspace
 rm -rf "${TEMP_DIR:?}"  # :? guard prevents rm -rf /
 mkdir -p "$MOUNT_POINT"
@@ -2421,8 +2439,12 @@ else
     [[ -b "$LOOP_MAP" ]] || die "Partition device $LOOP_MAP did not appear."
 
     log "Formatting partition ($LOOP_MAP)..."
-    # Disable metadata_csum (FEATURE_C12) at creation time to ensure initramfs compatibility
-    mkfs.ext4 -F -O ^metadata_csum "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    if $WHEEZY_GUEST; then
+        # Wheezy kernel 3.2 / GRUB 1.99 cannot read newer ext4 features.
+        mkfs.ext4 -F -O ^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file,^fast_commit "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    else
+        mkfs.ext4 -F -O ^metadata_csum "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    fi
 
     mount "$LOOP_MAP" "$MOUNT_POINT"
 fi
@@ -2468,7 +2490,7 @@ USED_BYTES=$(du -sb --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' \
     --exclude='tmp/*' --exclude='run/*' --exclude='mnt/*' \
     --exclude='media/*' --exclude='lost+found' \
     "${LXC_ROOT_MOUNT}/" 2>/dev/null | awk '{print $1}')
-SRC_SIZE_HR=$(numfmt --to=iec-i --suffix=B "${SRC_SIZE:-0}" 2>/dev/null || echo "${SRC_SIZE:-0} bytes")
+SRC_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$USED_BYTES" 2>/dev/null || echo "$USED_BYTES bytes")
 log "Source size: ${SRC_SIZE_HR} — starting copy..."
 
 # Detect unprivileged LXC ID mapping so ownership can be normalized in VM.
@@ -2613,6 +2635,69 @@ elif [[ -f "$MOUNT_POINT/etc/redhat-release" ]]; then
 fi
 log "Detected distro family: $DISTRO_FAMILY (ID: ${DISTRO_ID:-unknown})"
 
+# Wheezy uses eth0, not ens18. LXC may provide its network configuration
+# at runtime rather than via /etc/network/interfaces. Copy net0 settings
+# into the guest and preserve the MAC to match persistent udev NIC rules.
+WHEEZY_NET0_SPEC=""
+if $WHEEZY_GUEST; then
+    [[ "$DISTRO_ID" == "debian" ]] || die "Source Wheezy version probe disagrees with OS ID."
+    CT_NET0_LINE=$(printf '%s\n' "$CT_CONFIG_RAW" | sed -n 's/^net0: //p' | head -n1)
+    [[ -n "$CT_NET0_LINE" ]] || die "Wheezy conversion requires a net0 source configuration."
+    CT_NET0_MAC="" CT_NET0_IP="" CT_NET0_GW="" CT_NET0_MTU=""
+    IFS=',' read -r -a CT_NET0_FIELDS <<< "$CT_NET0_LINE"
+    for field in "${CT_NET0_FIELDS[@]}"; do
+        case "$field" in
+            hwaddr=*) CT_NET0_MAC="${field#hwaddr=}" ;;
+            ip=*) CT_NET0_IP="${field#ip=}" ;;
+            gw=*) CT_NET0_GW="${field#gw=}" ;;
+            mtu=*) CT_NET0_MTU="${field#mtu=}" ;;
+        esac
+    done
+    [[ "$CT_NET0_MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] ||
+        die "Source net0 lacks a valid MAC; refusing to guess the Wheezy eth0 name."
+    WHEEZY_NET0_SPEC="virtio=$CT_NET0_MAC,bridge=$BRIDGE"
+    if [[ -n "$CT_NET0_MTU" ]]; then
+        [[ "$CT_NET0_MTU" =~ ^[0-9]+$ ]] || die "Invalid source net0 MTU: $CT_NET0_MTU"
+        WHEEZY_NET0_SPEC="$WHEEZY_NET0_SPEC,mtu=$CT_NET0_MTU"
+    fi
+
+    if ! $KEEP_NETWORK; then
+        mkdir -p "$MOUNT_POINT/etc/network"
+        if [[ -e "$MOUNT_POINT/etc/network/interfaces" || -L "$MOUNT_POINT/etc/network/interfaces" ]]; then
+            cp -a "$MOUNT_POINT/etc/network/interfaces" "$MOUNT_POINT/etc/network/interfaces.pre-lxc-to-vm"
+        fi
+        rm -f "$MOUNT_POINT/etc/network/interfaces"
+        {
+            printf 'auto lo\niface lo inet loopback\n\nauto eth0\n'
+            case "$CT_NET0_IP" in
+                dhcp)
+                    printf 'iface eth0 inet dhcp\n'
+                    ;;
+                manual|"")
+                    printf 'iface eth0 inet manual\n'
+                    ;;
+                *)
+                    if [[ ! "$CT_NET0_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+                        die "Unsupported Wheezy net0 IPv4 specification: $CT_NET0_IP"
+                    fi
+                    CT_PREFIX="${CT_NET0_IP##*/}"
+                    CT_IPV4="${CT_NET0_IP%/*}"
+                    CT_MASK=$(( (0xFFFFFFFF << (32 - CT_PREFIX)) & 0xFFFFFFFF ))
+                    CT_NETMASK=$(printf '%d.%d.%d.%d' \
+                        $(( (CT_MASK >> 24) & 255 )) $(( (CT_MASK >> 16) & 255 )) \
+                        $(( (CT_MASK >> 8) & 255 )) $(( CT_MASK & 255 )))
+                    printf 'iface eth0 inet static\n    address %s\n    netmask %s\n' "$CT_IPV4" "$CT_NETMASK"
+                    [[ -z "$CT_NET0_GW" ]] || printf '    gateway %s\n' "$CT_NET0_GW"
+                    ;;
+            esac
+            [[ -z "$CT_NET0_MTU" ]] || printf '    mtu %s\n' "$CT_NET0_MTU"
+        } > "$MOUNT_POINT/etc/network/interfaces"
+        log "Wheezy eth0 configured from CT net0 (IP: $CT_NET0_IP; MTU: ${CT_NET0_MTU:-default})."
+    else
+        warn "--keep-network: preserving Wheezy network configuration without injecting ens18."
+    fi
+fi
+
 # --- CentOS 7 EOL repo fix ---
 # CentOS 7 reached EOL June 2024 and repos moved to vault.centos.org
 if [[ "$DISTRO_ID" == "centos" ]] && [[ -f "$MOUNT_POINT/etc/centos-release" ]]; then
@@ -2705,16 +2790,26 @@ for masked_unit in sys-kernel-config.mount sys-kernel-debug.mount; do
 done
 find /run -mindepth 1 -delete 2>/dev/null || true
 if [ -d /etc/systemd/system ] && [ ! -e /etc/systemd/system/default.target ]; then
-    ln -sf /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
+    for unit_dir in /lib/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$unit_dir/multi-user.target" ]; then
+            ln -sf "$unit_dir/multi-user.target" /etc/systemd/system/default.target
+            break
+        fi
+    done
 fi
 # Enable VGA and serial login prompts (containers use container-getty, VMs need getty)
 mkdir -p /etc/systemd/system/getty.target.wants
-if [ -f /usr/lib/systemd/system/getty@.service ]; then
-    ln -sf /usr/lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty1.service
-fi
-if [ -f /usr/lib/systemd/system/serial-getty@.service ]; then
-    ln -sf /usr/lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
-fi
+for unit_dir in /lib/systemd/system /usr/lib/systemd/system; do
+    if [ -f "$unit_dir/getty@.service" ]; then
+        ln -sf "$unit_dir/getty@.service" /etc/systemd/system/getty.target.wants/getty@tty1.service
+    fi
+    if [ -f "$unit_dir/serial-getty@.service" ]; then
+        ln -sf "$unit_dir/serial-getty@.service" /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
+    fi
+    if [ -f "$unit_dir/getty@.service" ]; then
+        break
+    fi
+done
 # Blacklist noisy modules that cause harmless but scary boot messages
 if [ -d /etc/modprobe.d ]; then
     echo "blacklist pcspkr" > /etc/modprobe.d/blacklist-pcspkr.conf
@@ -2731,7 +2826,10 @@ fi
 LXC_CLEANUP_BLOCK
 
 # --- Networking block (depends on --keep-network) ---
-if $KEEP_NETWORK; then
+# Wheezy networking has been configured (or explicitly preserved) above.
+if $WHEEZY_GUEST; then
+    :
+elif $KEEP_NETWORK; then
     cat >> "$CHROOT_SCRIPT" <<'NET_KEEP_BLOCK'
 # --- Networking (preserve mode) ---
 # Only add ens18 adapter without touching existing config
@@ -2788,7 +2886,29 @@ fi
 # --- Kernel + Bootloader install (distro-specific) ---
 case "$DISTRO_FAMILY" in
     debian)
-        if [[ "$BIOS_TYPE" == "ovmf" ]]; then
+        if $WHEEZY_GUEST; then
+            cat >> "$CHROOT_SCRIPT" <<DEBIAN_WHEEZY_BIOS
+# --- Debian 7 (Wheezy) legacy BIOS kernel and bootloader ---
+# Prevent grub-pc's post-install script from choosing host physical disks.
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+printf 'grub-pc grub-pc/install_devices multiselect\n' | debconf-set-selections
+printf 'grub-pc grub-pc/install_devices_empty boolean true\n' | debconf-set-selections
+# Options are local to these commands in the copied guest. Wheezy is EOL:
+# the Debian archive has expired signing keys and Release validity dates.
+apt-get -o Acquire::Check-Valid-Until=false update
+apt-get -y -o APT::Get::AllowUnauthenticated=true --no-install-recommends install \
+    linux-image-amd64 initramfs-tools grub-pc udev e2fsprogs ifupdown
+# Include storage and ext4 modules instead of detecting modern host hardware.
+if [ -f /etc/initramfs-tools/initramfs.conf ]; then
+    sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
+fi
+update-initramfs -u -k all
+# grub-install in Wheezy GRUB 1.99 has no --target or --skip-fs-probe.
+# LOOP_DEV is the loop device of the new VM disk image, never the host disk.
+grub-install --no-floppy --recheck --force "$LOOP_DEV"
+update-grub
+DEBIAN_WHEEZY_BIOS
+        elif [[ "$BIOS_TYPE" == "ovmf" ]]; then
             cat >> "$CHROOT_SCRIPT" <<DEBIAN_EFI
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -3145,17 +3265,25 @@ verbose "Phase 3: VM creation and disk import"
 log "Creating VM $VMID..."
 log "VM name: $VM_NAME"
 debug "VM configuration: memory=${MEMORY}MB, cores=$CORES, bridge=$BRIDGE, bios=$BIOS_TYPE"
+VM_NET0_SPEC="virtio,bridge=$BRIDGE"
+VM_DISK_SLOT="scsi0"
+VM_AGENT_SETTING="enabled=1"
+if $WHEEZY_GUEST; then
+    VM_NET0_SPEC="$WHEEZY_NET0_SPEC"
+    VM_DISK_SLOT="ide0"   # Linux 3.2 predates virtio_scsi.
+    VM_AGENT_SETTING="enabled=0" # Guest agent unavailable in Wheezy archive.
+fi
 qm create "$VMID" \
     --name "$VM_NAME" \
     --memory "$MEMORY" \
     --cores "$CORES" \
-    --net0 "virtio,bridge=${BRIDGE}" \
+    --net0 "$VM_NET0_SPEC" \
     --bios "$BIOS_TYPE" \
     --ostype "$OSTYPE" \
     --cpu host \
     --scsihw virtio-scsi-pci \
     --serial0 socket \
-    --agent enabled=1
+    --agent "$VM_AGENT_SETTING"
 
 # Add EFI disk for UEFI mode
 if [[ "$BIOS_TYPE" == "ovmf" ]]; then
@@ -3197,10 +3325,10 @@ if [[ -z "$IMPORTED_DISK" ]]; then
     warn "Could not auto-detect imported disk name. Guessing: $IMPORTED_DISK"
 fi
 
-log "Attaching disk: $IMPORTED_DISK"
-qm set "$VMID" --scsi0 "$IMPORTED_DISK"
-qm set "$VMID" --boot order=scsi0
-qm resize "$VMID" scsi0 "${DISK_SIZE}G" 2>/dev/null || true
+log "Attaching disk: $IMPORTED_DISK ($VM_DISK_SLOT)"
+qm set "$VMID" "--$VM_DISK_SLOT" "$IMPORTED_DISK"
+qm set "$VMID" --boot "order=$VM_DISK_SLOT"
+qm resize "$VMID" "$VM_DISK_SLOT" "${DISK_SIZE}G" 2>/dev/null || true
 
 # ==============================================================================
 # 7. POST-CONVERSION VALIDATION
@@ -3372,8 +3500,8 @@ VM_CONFIG_RC=$?
 run_check "VM config exists" "$VM_CONFIG_RC" ""
 
 # Check 2: Disk is attached
-DISK_ATTACHED=$(qm config "$VMID" 2>/dev/null | grep -c "scsi0:")
-run_check "Disk attached (scsi0)" $([[ "$DISK_ATTACHED" -ge 1 ]] && echo 0 || echo 1) ""
+DISK_ATTACHED=$(qm config "$VMID" 2>/dev/null | grep -c "^$VM_DISK_SLOT:")
+run_check "Disk attached ($VM_DISK_SLOT)" $([[ "$DISK_ATTACHED" -ge 1 ]] && echo 0 || echo 1) ""
 
 # Check 3: Boot order set
 BOOT_ORDER=$(qm config "$VMID" 2>/dev/null | grep "^boot:" | head -1)
@@ -3389,14 +3517,22 @@ if [[ "$BIOS_TYPE" == "ovmf" ]]; then
     run_check "EFI disk attached" $([[ "$EFI_DISK" -ge 1 ]] && echo 0 || echo 1) ""
 fi
 
-# Check 6: QEMU agent enabled
-AGENT_SET=$(qm config "$VMID" 2>/dev/null | grep -c "agent:")
-run_check "QEMU guest agent enabled" $([[ "$AGENT_SET" -ge 1 ]] && echo 0 || echo 1) ""
+# Check 6: QEMU agent enabled (not available in Debian 7 Wheezy)
+if ! $WHEEZY_GUEST; then
+    AGENT_SET=$(qm config "$VMID" 2>/dev/null | grep -c "agent:")
+    run_check "QEMU guest agent enabled" $([[ "$AGENT_SET" -ge 1 ]] && echo 0 || echo 1) ""
+else
+    log "Skipping QEMU guest-agent validation for Debian 7 Wheezy."
+fi
 
 log "Validation: ${CHECKS_PASSED}/${CHECKS_TOTAL} checks passed."
 
 # --- Auto-start & live health checks ---
-if $AUTO_START; then
+if $AUTO_START && $WHEEZY_GUEST; then
+    log "Starting legacy Debian 7 VM $VMID without QEMU guest agent..."
+    qm start "$VMID"
+    warn "Verify Debian 7 boot and networking manually using the VM console."
+elif $AUTO_START; then
     if [[ "$CHECKS_PASSED" -lt "$CHECKS_TOTAL" ]]; then
         warn "Not all checks passed. Starting VM anyway (some issues may exist)..."
     fi
@@ -3525,7 +3661,11 @@ e "  ${BOLD}Cores:${NC}       $CORES"
 e "  ${BOLD}Disk:${NC}        ${DISK_SIZE}GB ($DISK_FORMAT)"
 e "  ${BOLD}Firmware:${NC}    $BIOS_TYPE"
 e "  ${BOLD}Distro:${NC}      $DISTRO_FAMILY (${DISTRO_ID:-unknown})"
-e "  ${BOLD}Network:${NC}     $($KEEP_NETWORK && echo 'preserved' || echo 'DHCP on ens18') (bridge: $BRIDGE)"
+if $WHEEZY_GUEST; then
+    e "  ${BOLD}Network:${NC}     eth0 (bridge: $BRIDGE; source MAC preserved)"
+else
+    e "  ${BOLD}Network:${NC}     $($KEEP_NETWORK && echo 'preserved' || echo 'DHCP on ens18') (bridge: $BRIDGE)"
+fi
 e "  ${BOLD}Snapshot:${NC}    $([[ "$CREATE_SNAPSHOT" == "true" ]] && echo 'created' || echo 'none')"
 e "  ${BOLD}Destroy source:${NC}  $DESTROY_SOURCE"
 e "  ${BOLD}Validation:${NC}  ${CHECKS_PASSED}/${CHECKS_TOTAL} checks passed"
