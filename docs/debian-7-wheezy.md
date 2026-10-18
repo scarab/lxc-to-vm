@@ -16,7 +16,8 @@ For this guest only, `lxc-to-vm.sh`:
 - Installs `linux-image-amd64`, `initramfs-tools`, and `grub-pc` in the
   **copied VM rootfs**, without requiring `qemu-guest-agent` or changing init.
 - Uses legacy `grub-install --no-floppy --recheck --force` syntax on the
-  temporary *loop device*. It does not select a host physical disk for GRUB.
+  temporary *loop device*. The intended GRUB destination is the temporary loop disk, never a
+  host physical disk.
 - Allows expired repository signatures only on the copied guest's APT install
   command; the source CT and Proxmox host APT configuration are unchanged.
 - Attaches the new root disk as IDE (`ide0`), disables the QEMU guest agent,
@@ -42,9 +43,16 @@ persistent-udev rules, or routing configuration.
    and that the guest can resolve/reach `archive.debian.org`.
 4. Keep `--destroy-source` and `--start` **off** during the first test.
 
-For example, on Proxmox VE:
+For example, on Proxmox VE, fetch the **fork's feature branch** to avoid
+accidentally running an older upstream checkout:
 
 ```bash
+cd /root
+git clone --branch fix/debian-7-wheezy --single-branch \\
+    https://github.com/scarab/lxc-to-vm.git lxc-to-vm-wheezy
+cd lxc-to-vm-wheezy
+bash -n lxc-to-vm.sh
+
 pct set 102 --onboot 0
 vzdump 102 --mode stop --dumpdir /mnt/fast/dump --compress zstd
 ./lxc-to-vm.sh -c 102 -v 104 -s fast -d 20 -b vmbr2 -t /mnt/fast/dump
@@ -86,9 +94,10 @@ APT `AllowUnauthenticated` option for the **copied guest only**, which
 reduces package authenticity assurance. Use a trusted, controlled network
 and validate packages separately if possible.
 
-This path is not tested against a live Wheezy machine in CI. GitHub Actions
-checks Bash syntax and ShellCheck, but only an actual VM boot can validate
-old GRUB, kernel driver availability, init and networking behavior.
+This path has not been tested against a live Wheezy machine. The repository
+contains GitHub Actions workflows for Bash syntax and ShellCheck, but runs
+were not visible on this fork when the PR was created. Run `bash -n` locally;
+only an actual VM boot can validate old GRUB, kernel drivers, init and networking.
 
 Using `--keep-network` deliberately preserves the guest interfaces file
 and does **not** inject a new `ens18` or IP setup. LXC often configures
