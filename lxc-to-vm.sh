@@ -2363,6 +2363,24 @@ MOUNT_POINT="${TEMP_DIR}/mnt"
 log "Source CTID=$CTID  Target VMID=$VMID  Storage=$STORAGE  Disk=${DISK_SIZE}GB  Format=$DISK_FORMAT  Bridge=$BRIDGE  ExtraPkgs=${PKG_ADDON_LIST:-none}"
 log "Working directory: $TEMP_DIR"
 
+# Detect Debian 7 before creating the filesystem: Linux 3.2 cannot read
+# all ext4 features enabled by a modern e2fsprogs/mke2fs.
+WHEEZY_GUEST=false
+if [[ "$(pct config "$CTID" | awk '/^ostype:/{print $2; exit}')" == "debian" ]]; then
+    log "Checking source Debian version before disk formatting..."
+    pct_mount_retry "$CTID" || die "Cannot mount CT $CTID for Debian version detection."
+    if [[ -f "/var/lib/lxc/$CTID/rootfs/etc/debian_version" ]] &&
+       grep -qE '^7([.]|$)' "/var/lib/lxc/$CTID/rootfs/etc/debian_version"; then
+        WHEEZY_GUEST=true
+    fi
+    pct unmount "$CTID" || die "Cannot unmount CT $CTID after Debian version check."
+fi
+if $WHEEZY_GUEST; then
+    [[ "$BIOS_TYPE" == "seabios" ]] || die "Debian 7 Wheezy conversion supports SeaBIOS only."
+    warn "Debian 7 Wheezy (EOL): legacy ext4, GRUB, and APT handling enabled."
+    warn "Expired APT archive signatures will be accepted in the copied guest only."
+fi
+
 # Create Workspace
 rm -rf "${TEMP_DIR:?}"  # :? guard prevents rm -rf /
 mkdir -p "$MOUNT_POINT"
@@ -2421,8 +2439,12 @@ else
     [[ -b "$LOOP_MAP" ]] || die "Partition device $LOOP_MAP did not appear."
 
     log "Formatting partition ($LOOP_MAP)..."
-    # Disable metadata_csum (FEATURE_C12) at creation time to ensure initramfs compatibility
-    mkfs.ext4 -F -O ^metadata_csum "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    if $WHEEZY_GUEST; then
+        # Wheezy kernel 3.2 / GRUB 1.99 cannot read newer ext4 features.
+        mkfs.ext4 -F -O ^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file,^fast_commit "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    else
+        mkfs.ext4 -F -O ^metadata_csum "$LOOP_MAP" >> "$LOG_FILE" 2>&1
+    fi
 
     mount "$LOOP_MAP" "$MOUNT_POINT"
 fi
@@ -2468,7 +2490,7 @@ USED_BYTES=$(du -sb --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' \
     --exclude='tmp/*' --exclude='run/*' --exclude='mnt/*' \
     --exclude='media/*' --exclude='lost+found' \
     "${LXC_ROOT_MOUNT}/" 2>/dev/null | awk '{print $1}')
-SRC_SIZE_HR=$(numfmt --to=iec-i --suffix=B "${SRC_SIZE:-0}" 2>/dev/null || echo "${SRC_SIZE:-0} bytes")
+SRC_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$USED_BYTES" 2>/dev/null || echo "$USED_BYTES bytes")
 log "Source size: ${SRC_SIZE_HR} — starting copy..."
 
 # Detect unprivileged LXC ID mapping so ownership can be normalized in VM.
