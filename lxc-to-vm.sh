@@ -2635,6 +2635,69 @@ elif [[ -f "$MOUNT_POINT/etc/redhat-release" ]]; then
 fi
 log "Detected distro family: $DISTRO_FAMILY (ID: ${DISTRO_ID:-unknown})"
 
+# Wheezy uses eth0, not ens18. LXC may provide its network configuration
+# at runtime rather than via /etc/network/interfaces. Copy net0 settings
+# into the guest and preserve the MAC to match persistent udev NIC rules.
+WHEEZY_NET0_SPEC=""
+if $WHEEZY_GUEST; then
+    [[ "$DISTRO_ID" == "debian" ]] || die "Source Wheezy version probe disagrees with OS ID."
+    CT_NET0_LINE=$(printf '%s\n' "$CT_CONFIG_RAW" | sed -n 's/^net0: //p' | head -n1)
+    [[ -n "$CT_NET0_LINE" ]] || die "Wheezy conversion requires a net0 source configuration."
+    CT_NET0_MAC="" CT_NET0_IP="" CT_NET0_GW="" CT_NET0_MTU=""
+    IFS=',' read -r -a CT_NET0_FIELDS <<< "$CT_NET0_LINE"
+    for field in "${CT_NET0_FIELDS[@]}"; do
+        case "$field" in
+            hwaddr=*) CT_NET0_MAC="${field#hwaddr=}" ;;
+            ip=*) CT_NET0_IP="${field#ip=}" ;;
+            gw=*) CT_NET0_GW="${field#gw=}" ;;
+            mtu=*) CT_NET0_MTU="${field#mtu=}" ;;
+        esac
+    done
+    [[ "$CT_NET0_MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] ||
+        die "Source net0 lacks a valid MAC; refusing to guess the Wheezy eth0 name."
+    WHEEZY_NET0_SPEC="virtio=$CT_NET0_MAC,bridge=$BRIDGE"
+    if [[ -n "$CT_NET0_MTU" ]]; then
+        [[ "$CT_NET0_MTU" =~ ^[0-9]+$ ]] || die "Invalid source net0 MTU: $CT_NET0_MTU"
+        WHEEZY_NET0_SPEC="$WHEEZY_NET0_SPEC,mtu=$CT_NET0_MTU"
+    fi
+
+    if ! $KEEP_NETWORK; then
+        mkdir -p "$MOUNT_POINT/etc/network"
+        if [[ -e "$MOUNT_POINT/etc/network/interfaces" || -L "$MOUNT_POINT/etc/network/interfaces" ]]; then
+            cp -a "$MOUNT_POINT/etc/network/interfaces" "$MOUNT_POINT/etc/network/interfaces.pre-lxc-to-vm"
+        fi
+        rm -f "$MOUNT_POINT/etc/network/interfaces"
+        {
+            printf 'auto lo\niface lo inet loopback\n\nauto eth0\n'
+            case "$CT_NET0_IP" in
+                dhcp)
+                    printf 'iface eth0 inet dhcp\n'
+                    ;;
+                manual|"")
+                    printf 'iface eth0 inet manual\n'
+                    ;;
+                *)
+                    if [[ ! "$CT_NET0_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+                        die "Unsupported Wheezy net0 IPv4 specification: $CT_NET0_IP"
+                    fi
+                    CT_PREFIX="${CT_NET0_IP##*/}"
+                    CT_IPV4="${CT_NET0_IP%/*}"
+                    CT_MASK=$(( (0xFFFFFFFF << (32 - CT_PREFIX)) & 0xFFFFFFFF ))
+                    CT_NETMASK=$(printf '%d.%d.%d.%d' \
+                        $(( (CT_MASK >> 24) & 255 )) $(( (CT_MASK >> 16) & 255 )) \
+                        $(( (CT_MASK >> 8) & 255 )) $(( CT_MASK & 255 )))
+                    printf 'iface eth0 inet static\n    address %s\n    netmask %s\n' "$CT_IPV4" "$CT_NETMASK"
+                    [[ -z "$CT_NET0_GW" ]] || printf '    gateway %s\n' "$CT_NET0_GW"
+                    ;;
+            esac
+            [[ -z "$CT_NET0_MTU" ]] || printf '    mtu %s\n' "$CT_NET0_MTU"
+        } > "$MOUNT_POINT/etc/network/interfaces"
+        log "Wheezy eth0 configured from CT net0 (IP: $CT_NET0_IP; MTU: ${CT_NET0_MTU:-default})."
+    else
+        warn "--keep-network: preserving Wheezy network configuration without injecting ens18."
+    fi
+fi
+
 # --- CentOS 7 EOL repo fix ---
 # CentOS 7 reached EOL June 2024 and repos moved to vault.centos.org
 if [[ "$DISTRO_ID" == "centos" ]] && [[ -f "$MOUNT_POINT/etc/centos-release" ]]; then
@@ -2727,16 +2790,26 @@ for masked_unit in sys-kernel-config.mount sys-kernel-debug.mount; do
 done
 find /run -mindepth 1 -delete 2>/dev/null || true
 if [ -d /etc/systemd/system ] && [ ! -e /etc/systemd/system/default.target ]; then
-    ln -sf /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
+    for unit_dir in /lib/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$unit_dir/multi-user.target" ]; then
+            ln -sf "$unit_dir/multi-user.target" /etc/systemd/system/default.target
+            break
+        fi
+    done
 fi
 # Enable VGA and serial login prompts (containers use container-getty, VMs need getty)
 mkdir -p /etc/systemd/system/getty.target.wants
-if [ -f /usr/lib/systemd/system/getty@.service ]; then
-    ln -sf /usr/lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty1.service
-fi
-if [ -f /usr/lib/systemd/system/serial-getty@.service ]; then
-    ln -sf /usr/lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
-fi
+for unit_dir in /lib/systemd/system /usr/lib/systemd/system; do
+    if [ -f "$unit_dir/getty@.service" ]; then
+        ln -sf "$unit_dir/getty@.service" /etc/systemd/system/getty.target.wants/getty@tty1.service
+    fi
+    if [ -f "$unit_dir/serial-getty@.service" ]; then
+        ln -sf "$unit_dir/serial-getty@.service" /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
+    fi
+    if [ -f "$unit_dir/getty@.service" ]; then
+        break
+    fi
+done
 # Blacklist noisy modules that cause harmless but scary boot messages
 if [ -d /etc/modprobe.d ]; then
     echo "blacklist pcspkr" > /etc/modprobe.d/blacklist-pcspkr.conf
@@ -2753,7 +2826,10 @@ fi
 LXC_CLEANUP_BLOCK
 
 # --- Networking block (depends on --keep-network) ---
-if $KEEP_NETWORK; then
+# Wheezy networking has been configured (or explicitly preserved) above.
+if $WHEEZY_GUEST; then
+    :
+elif $KEEP_NETWORK; then
     cat >> "$CHROOT_SCRIPT" <<'NET_KEEP_BLOCK'
 # --- Networking (preserve mode) ---
 # Only add ens18 adapter without touching existing config
