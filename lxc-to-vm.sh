@@ -2897,7 +2897,7 @@ printf 'grub-pc grub-pc/install_devices_empty boolean true\n' | debconf-set-sele
 # the Debian archive has expired signing keys and Release validity dates.
 apt-get -o Acquire::Check-Valid-Until=false update
 apt-get -y -o APT::Get::AllowUnauthenticated=true --no-install-recommends install \
-    linux-image-amd64 initramfs-tools grub-pc
+    linux-image-amd64 initramfs-tools grub-pc udev e2fsprogs ifupdown
 # Include storage and ext4 modules instead of detecting modern host hardware.
 if [ -f /etc/initramfs-tools/initramfs.conf ]; then
     sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
