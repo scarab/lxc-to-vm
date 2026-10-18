@@ -2886,7 +2886,29 @@ fi
 # --- Kernel + Bootloader install (distro-specific) ---
 case "$DISTRO_FAMILY" in
     debian)
-        if [[ "$BIOS_TYPE" == "ovmf" ]]; then
+        if $WHEEZY_GUEST; then
+            cat >> "$CHROOT_SCRIPT" <<DEBIAN_WHEEZY_BIOS
+# --- Debian 7 (Wheezy) legacy BIOS kernel and bootloader ---
+# Prevent grub-pc's post-install script from choosing host physical disks.
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+printf 'grub-pc grub-pc/install_devices multiselect\n' | debconf-set-selections
+printf 'grub-pc grub-pc/install_devices_empty boolean true\n' | debconf-set-selections
+# Options are local to these commands in the copied guest. Wheezy is EOL:
+# the Debian archive has expired signing keys and Release validity dates.
+apt-get -o Acquire::Check-Valid-Until=false update
+apt-get -y -o APT::Get::AllowUnauthenticated=true --no-install-recommends install \
+    linux-image-amd64 initramfs-tools grub-pc
+# Include storage and ext4 modules instead of detecting modern host hardware.
+if [ -f /etc/initramfs-tools/initramfs.conf ]; then
+    sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
+fi
+update-initramfs -u -k all
+# grub-install in Wheezy GRUB 1.99 has no --target or --skip-fs-probe.
+# LOOP_DEV is the loop device of the new VM disk image, never the host disk.
+grub-install --no-floppy --recheck --force "$LOOP_DEV"
+update-grub
+DEBIAN_WHEEZY_BIOS
+        elif [[ "$BIOS_TYPE" == "ovmf" ]]; then
             cat >> "$CHROOT_SCRIPT" <<DEBIAN_EFI
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -3243,17 +3265,25 @@ verbose "Phase 3: VM creation and disk import"
 log "Creating VM $VMID..."
 log "VM name: $VM_NAME"
 debug "VM configuration: memory=${MEMORY}MB, cores=$CORES, bridge=$BRIDGE, bios=$BIOS_TYPE"
+VM_NET0_SPEC="virtio,bridge=$BRIDGE"
+VM_DISK_SLOT="scsi0"
+VM_AGENT_SETTING="enabled=1"
+if $WHEEZY_GUEST; then
+    VM_NET0_SPEC="$WHEEZY_NET0_SPEC"
+    VM_DISK_SLOT="ide0"   # Linux 3.2 predates virtio_scsi.
+    VM_AGENT_SETTING="enabled=0" # Guest agent unavailable in Wheezy archive.
+fi
 qm create "$VMID" \
     --name "$VM_NAME" \
     --memory "$MEMORY" \
     --cores "$CORES" \
-    --net0 "virtio,bridge=${BRIDGE}" \
+    --net0 "$VM_NET0_SPEC" \
     --bios "$BIOS_TYPE" \
     --ostype "$OSTYPE" \
     --cpu host \
     --scsihw virtio-scsi-pci \
     --serial0 socket \
-    --agent enabled=1
+    --agent "$VM_AGENT_SETTING"
 
 # Add EFI disk for UEFI mode
 if [[ "$BIOS_TYPE" == "ovmf" ]]; then
@@ -3295,10 +3325,10 @@ if [[ -z "$IMPORTED_DISK" ]]; then
     warn "Could not auto-detect imported disk name. Guessing: $IMPORTED_DISK"
 fi
 
-log "Attaching disk: $IMPORTED_DISK"
-qm set "$VMID" --scsi0 "$IMPORTED_DISK"
-qm set "$VMID" --boot order=scsi0
-qm resize "$VMID" scsi0 "${DISK_SIZE}G" 2>/dev/null || true
+log "Attaching disk: $IMPORTED_DISK ($VM_DISK_SLOT)"
+qm set "$VMID" "--$VM_DISK_SLOT" "$IMPORTED_DISK"
+qm set "$VMID" --boot "order=$VM_DISK_SLOT"
+qm resize "$VMID" "$VM_DISK_SLOT" "${DISK_SIZE}G" 2>/dev/null || true
 
 # ==============================================================================
 # 7. POST-CONVERSION VALIDATION
