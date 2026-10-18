@@ -48,7 +48,7 @@ accidentally running an older upstream checkout:
 
 ```bash
 cd /root
-git clone --branch fix/debian-7-wheezy --single-branch \\
+git clone --branch fix/debian-7-wheezy --single-branch \
     https://github.com/scarab/lxc-to-vm.git lxc-to-vm-wheezy
 cd lxc-to-vm-wheezy
 bash -n lxc-to-vm.sh
