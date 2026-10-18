@@ -3500,8 +3500,8 @@ VM_CONFIG_RC=$?
 run_check "VM config exists" "$VM_CONFIG_RC" ""
 
 # Check 2: Disk is attached
-DISK_ATTACHED=$(qm config "$VMID" 2>/dev/null | grep -c "scsi0:")
-run_check "Disk attached (scsi0)" $([[ "$DISK_ATTACHED" -ge 1 ]] && echo 0 || echo 1) ""
+DISK_ATTACHED=$(qm config "$VMID" 2>/dev/null | grep -c "^$VM_DISK_SLOT:")
+run_check "Disk attached ($VM_DISK_SLOT)" $([[ "$DISK_ATTACHED" -ge 1 ]] && echo 0 || echo 1) ""
 
 # Check 3: Boot order set
 BOOT_ORDER=$(qm config "$VMID" 2>/dev/null | grep "^boot:" | head -1)
@@ -3517,14 +3517,22 @@ if [[ "$BIOS_TYPE" == "ovmf" ]]; then
     run_check "EFI disk attached" $([[ "$EFI_DISK" -ge 1 ]] && echo 0 || echo 1) ""
 fi
 
-# Check 6: QEMU agent enabled
-AGENT_SET=$(qm config "$VMID" 2>/dev/null | grep -c "agent:")
-run_check "QEMU guest agent enabled" $([[ "$AGENT_SET" -ge 1 ]] && echo 0 || echo 1) ""
+# Check 6: QEMU agent enabled (not available in Debian 7 Wheezy)
+if ! $WHEEZY_GUEST; then
+    AGENT_SET=$(qm config "$VMID" 2>/dev/null | grep -c "agent:")
+    run_check "QEMU guest agent enabled" $([[ "$AGENT_SET" -ge 1 ]] && echo 0 || echo 1) ""
+else
+    log "Skipping QEMU guest-agent validation for Debian 7 Wheezy."
+fi
 
 log "Validation: ${CHECKS_PASSED}/${CHECKS_TOTAL} checks passed."
 
 # --- Auto-start & live health checks ---
-if $AUTO_START; then
+if $AUTO_START && $WHEEZY_GUEST; then
+    log "Starting legacy Debian 7 VM $VMID without QEMU guest agent..."
+    qm start "$VMID"
+    warn "Verify Debian 7 boot and networking manually using the VM console."
+elif $AUTO_START; then
     if [[ "$CHECKS_PASSED" -lt "$CHECKS_TOTAL" ]]; then
         warn "Not all checks passed. Starting VM anyway (some issues may exist)..."
     fi
@@ -3653,7 +3661,11 @@ e "  ${BOLD}Cores:${NC}       $CORES"
 e "  ${BOLD}Disk:${NC}        ${DISK_SIZE}GB ($DISK_FORMAT)"
 e "  ${BOLD}Firmware:${NC}    $BIOS_TYPE"
 e "  ${BOLD}Distro:${NC}      $DISTRO_FAMILY (${DISTRO_ID:-unknown})"
-e "  ${BOLD}Network:${NC}     $($KEEP_NETWORK && echo 'preserved' || echo 'DHCP on ens18') (bridge: $BRIDGE)"
+if $WHEEZY_GUEST; then
+    e "  ${BOLD}Network:${NC}     eth0 (bridge: $BRIDGE; source MAC preserved)"
+else
+    e "  ${BOLD}Network:${NC}     $($KEEP_NETWORK && echo 'preserved' || echo 'DHCP on ens18') (bridge: $BRIDGE)"
+fi
 e "  ${BOLD}Snapshot:${NC}    $([[ "$CREATE_SNAPSHOT" == "true" ]] && echo 'created' || echo 'none')"
 e "  ${BOLD}Destroy source:${NC}  $DESTROY_SOURCE"
 e "  ${BOLD}Validation:${NC}  ${CHECKS_PASSED}/${CHECKS_TOTAL} checks passed"
